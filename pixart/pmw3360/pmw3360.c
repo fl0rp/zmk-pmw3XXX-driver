@@ -528,22 +528,23 @@ static void irq_handler(const struct device *gpiob, struct gpio_callback *cb, ui
     const struct device *dev = data->dev;
     const struct pixart_config *config = dev->config;
 
-    LOG_INF("In irq handler");
-    // disable the interrupt line first
-    err = gpio_pin_interrupt_configure_dt(&config->irq_gpio, GPIO_INT_DISABLE);
-    if (unlikely(err)) {
-        LOG_ERR("Cannot disable IRQ");
-        k_panic();
+    if (config->irq_gpio.port != NULL) {
+        LOG_INF("In irq handler");
+        // disable the interrupt line first
+        err = gpio_pin_interrupt_configure_dt(&config->irq_gpio, GPIO_INT_DISABLE);
+        if (unlikely(err)) {
+            LOG_ERR("Cannot disable IRQ");
+            k_panic();
+        }
     }
 
     // submit the real handler work
-    k_work_submit(&data->trigger_handler_work);
+    k_work_submit(&data->trigger_work);
 }
-
 static void trigger_handler(struct k_work *work) {
     sensor_trigger_handler_t handler;
     int err = 0;
-    struct pixart_data *data = CONTAINER_OF(work, struct pixart_data, trigger_handler_work);
+    struct pixart_data *data = CONTAINER_OF(work, struct pixart_data, trigger_work);
     const struct device *dev = data->dev;
     const struct pixart_config *config = dev->config;
 
@@ -566,7 +567,11 @@ static void trigger_handler(struct k_work *work) {
     // if data_ready_handler is non-NULL, otherwise keep it inactive
     key = k_spin_lock(&data->lock);
     if (data->data_ready_handler) {
-        err = gpio_pin_interrupt_configure_dt(&config->irq_gpio, GPIO_INT_LEVEL_ACTIVE);
+        if (config->irq_gpio.port != NULL) {
+            err = gpio_pin_interrupt_configure_dt(&config->irq_gpio, GPIO_INT_LEVEL_ACTIVE);
+        } else {
+            k_timer_start(&data->poll_timer, K_MSEC(10), K_NO_WAIT);
+        }
     }
     k_spin_unlock(&data->lock, key);
 
@@ -630,37 +635,48 @@ static void pmw3360_async_init(struct k_work *work) {
     }
 }
 
-static int pmw3360_init_irq(const struct device *dev) {
-     LOG_INF("Configure irq...");
+static void pmw3360_poll_timer_handler(struct k_timer *timer) {
+    struct pixart_data *data = CONTAINER_OF(timer, struct pixart_data, poll_timer);
+    k_work_submit(&data->trigger_work);
+}
 
-    int err;
+static int pmw3360_init_irq(const struct device *dev) {
     struct pixart_data *data = dev->data;
     const struct pixart_config *config = dev->config;
+    int err;
 
-    // check readiness of irq gpio pin
-    if (!device_is_ready(config->irq_gpio.port)) {
-        LOG_ERR("IRQ GPIO device not ready");
-        return -ENODEV;
+    if (config->irq_gpio.port != NULL) {
+        LOG_INF("Configure irq...");
+
+        // check readiness of irq gpio pin
+        if (!device_is_ready(config->irq_gpio.port)) {
+            LOG_ERR("IRQ GPIO device not ready");
+            return -ENODEV;
+        }
+
+        // init the irq pin
+        err = gpio_pin_configure_dt(&config->irq_gpio, GPIO_INPUT);
+        if (err) {
+            LOG_ERR("Cannot configure IRQ GPIO");
+            return err;
+        }
+
+        // setup and add the irq callback associated
+        gpio_init_callback(&data->irq_gpio_cb, irq_handler, BIT(config->irq_gpio.pin));
+
+        err = gpio_add_callback(config->irq_gpio.port, &data->irq_gpio_cb);
+        if (err) {
+            LOG_ERR("Cannot add IRQ GPIO callback");
+        }
+
+        LOG_INF("Configure irq done");
+    } else {
+        LOG_INF("No IRQ GPIO, use polling");
+
+        k_timer_init(&data->poll_timer, pmw3360_poll_timer_handler, NULL);
     }
 
-    // init the irq pin
-    err = gpio_pin_configure_dt(&config->irq_gpio, GPIO_INPUT);
-    if (err) {
-        LOG_ERR("Cannot configure IRQ GPIO");
-        return err;
-    }
-
-    // setup and add the irq callback associated
-    gpio_init_callback(&data->irq_gpio_cb, irq_handler, BIT(config->irq_gpio.pin));
-
-    err = gpio_add_callback(config->irq_gpio.port, &data->irq_gpio_cb);
-    if (err) {
-        LOG_ERR("Cannot add IRQ GPIO callback");
-    }
-
-    LOG_INF("Configure irq done");
-
-    return err;
+    return 0;
 }
 
 static int pmw3360_init(const struct device *dev) {
@@ -674,7 +690,7 @@ static int pmw3360_init(const struct device *dev) {
     data->dev = dev;
 
     // init trigger handler work
-    k_work_init(&data->trigger_handler_work, trigger_handler);
+    k_work_init(&data->trigger_work, trigger_handler);
 
     // check readiness of spi bus
 //    if (!device_is_ready(&config->cs_gpio.port)) {
@@ -815,9 +831,19 @@ static int pmw3360_trigger_set(const struct device *dev, const struct sensor_tri
     // if non-NULL (a real handler defined), eanble the interrupt line
     // otherwise, disable the interrupt line
     if (handler) {
-        err = gpio_pin_interrupt_configure_dt(&config->irq_gpio, GPIO_INT_LEVEL_ACTIVE);
+        if (config->irq_gpio.port != NULL) {
+            err = gpio_pin_interrupt_configure_dt(&config->irq_gpio, GPIO_INT_LEVEL_ACTIVE);
+        } else {
+            k_timer_start(&data->poll_timer, K_MSEC(10), K_NO_WAIT);
+            err = 0;
+        }
     } else {
-        err = gpio_pin_interrupt_configure_dt(&config->irq_gpio, GPIO_INT_DISABLE);
+        if (config->irq_gpio.port != NULL) {
+            err = gpio_pin_interrupt_configure_dt(&config->irq_gpio, GPIO_INT_DISABLE);
+        } else {
+            k_timer_stop(&data->poll_timer);
+            err = 0;
+        }
     }
 
     if (!err) {
@@ -894,7 +920,7 @@ static int pmw3360_trigger_set(const struct device *dev, const struct sensor_tri
     static int32_t scroll_layers##n[] = DT_PROP(DT_DRV_INST(n), scroll_layers);                    \
     static int32_t snipe_layers##n[] = DT_PROP(DT_DRV_INST(n), snipe_layers);                      \
     static const struct pixart_config config##n = {                                                \
-        .irq_gpio = GPIO_DT_SPEC_INST_GET(n, irq_gpios),                                           \
+        .irq_gpio = GPIO_DT_SPEC_INST_GET_OR(n, irq_gpios, {0}),                                   \
         .bus =                                                                                     \
             {                                                                                      \
                 .bus = DEVICE_DT_GET(DT_INST_BUS(n)),                                              \
