@@ -534,7 +534,12 @@ static void pmw3610_async_init(struct k_work *work) {
         if (data->async_init_step == ASYNC_INIT_STEP_COUNT) {
             data->ready = true; // sensor is ready to work
             LOG_INF("PMW3610 initialized");
-            set_interrupt(dev, true);
+            const struct pixart_config *config = dev->config;
+            if (config->irq_gpio.port != NULL) {
+                set_interrupt(dev, true);
+            } else {
+                k_work_schedule(&data->poll_work, K_MSEC(config->poll_interval_ms));
+            }
         } else {
             k_work_schedule(&data->init_work, K_MSEC(async_init_delay[data->async_init_step]));
         }
@@ -559,6 +564,17 @@ static void deactivate_automouse_layer(struct k_timer *timer) {
 
 K_TIMER_DEFINE(automouse_layer_timer, deactivate_automouse_layer, NULL);
 #endif
+
+static void pmw3610_poll_work_callback(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct pixart_data *data = CONTAINER_OF(dwork, struct pixart_data, poll_work);
+    const struct device *dev = data->dev;
+    const struct pixart_config *config = dev->config;
+
+    pmw3610_report_data(dev);
+
+    k_work_schedule(&data->poll_work, K_MSEC(config->poll_interval_ms));
+}
 
 static enum pixart_input_mode get_input_mode_for_current_layer(const struct device *dev) {
     const struct pixart_config *config = dev->config;
@@ -726,17 +742,26 @@ static void pmw3610_gpio_callback(const struct device *gpiob, struct gpio_callba
 static void pmw3610_work_callback(struct k_work *work) {
     struct pixart_data *data = CONTAINER_OF(work, struct pixart_data, trigger_work);
     const struct device *dev = data->dev;
+    const struct pixart_config *config = dev->config;
 
     pmw3610_report_data(dev);
-    set_interrupt(dev, true);
+    if (config->irq_gpio.port != NULL) {
+        set_interrupt(dev, true);
+    }
 }
 
 static int pmw3610_init_irq(const struct device *dev) {
+    const struct pixart_config *config = dev->config;
+
+    if (config->irq_gpio.port == NULL) {
+        LOG_INF("No IRQ GPIO provided, using polling");
+        return 0;
+    }
+
     LOG_INF("Configure irq...");
 
     int err;
     struct pixart_data *data = dev->data;
-    const struct pixart_config *config = dev->config;
 
     // check readiness of irq gpio pin
     if (!device_is_ready(config->irq_gpio.port)) {
@@ -780,6 +805,9 @@ static int pmw3610_init(const struct device *dev) {
     // init trigger handler work
     k_work_init(&data->trigger_work, pmw3610_work_callback);
 
+    // init poll handler work
+    k_work_init_delayable(&data->poll_work, pmw3610_poll_work_callback);
+
     // check readiness of cs gpio pin and init it to inactive
     if (!device_is_ready(config->cs_gpio.port)) {
         LOG_ERR("SPI CS device not ready");
@@ -815,7 +843,8 @@ static int pmw3610_init(const struct device *dev) {
     static int32_t scroll_layers##n[] = DT_PROP(DT_DRV_INST(n), scroll_layers);                    \
     static int32_t snipe_layers##n[] = DT_PROP(DT_DRV_INST(n), snipe_layers);                      \
     static const struct pixart_config config##n = {                                                \
-        .irq_gpio = GPIO_DT_SPEC_INST_GET(n, irq_gpios),                                           \
+        .irq_gpio = GPIO_DT_SPEC_INST_GET_OR(n, irq_gpios, {0}),                                   \
+        .poll_interval_ms = DT_INST_PROP(n, poll_interval_ms),                                     \
         .bus =                                                                                     \
             {                                                                                      \
                 .bus = DEVICE_DT_GET(DT_INST_BUS(n)),                                              \

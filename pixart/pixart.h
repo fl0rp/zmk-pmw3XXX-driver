@@ -37,6 +37,9 @@ struct pixart_data {
     // the work structure holding the trigger job
     struct k_work trigger_work;
 
+    // the work structure for polling
+    struct k_work_delayable poll_work;
+
     // the work structure for delayable init steps
     struct k_work_delayable init_work;
     int async_init_step;
@@ -53,6 +56,7 @@ struct pixart_data {
 // device config data structure
 struct pixart_config {
     struct gpio_dt_spec irq_gpio;
+    uint32_t poll_interval_ms;
     struct spi_dt_spec bus;
     struct gpio_dt_spec cs_gpio;
     size_t scroll_layers_len;
